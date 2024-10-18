@@ -1,566 +1,653 @@
-import tkinter as tk
-from tkinter import ttk
-from PIL import Image, ImageTk
+import threading
 import numpy as np
+from tkinter import *
+from tkinter import ttk
+from PIL import Image, ImageTk, ImageEnhance
 import time
+from numba import jit  # Numba importálása
+import cv2
 from concurrent.futures import ThreadPoolExecutor
-from numba import njit
 
-current_brightness = 0
 
-def adjust_brightness_sequential(img, brightness):
-    pixels = np.array(img)
-    factor =  brightness / 100.0
-    pixels = np.clip(pixels * (1 + factor), 0, 255)
-    return Image.fromarray(pixels.astype(np.uint8))
+# Globális változók a kép és a fényerő kezeléséhez
+original_image = Image.open('photo.jfif')  # Kép fájl neve
+brightness_value = 1  # Kezdeti fényerő érték (1 = eredeti)
+contrast_value = 1  # Kezdeti fényerő érték (1 = eredeti)
 
-def adjust_brightness_simd(img, brightness):
-    pixels = np.array(img, dtype=np.float32)
-    factor = brightness / 100.0
-    pixels *= (1 + factor)
-    np.clip(pixels, 0, 255, out=pixels)
-    return Image.fromarray(pixels.astype(np.uint8))
+bui_avail = 1
+sec_avail = 1
+simd_avail = 1
+multi_avail = 1
 
-def adjust_brightness_multithreading(img, brightness):
-    pixels = np.array(img)
-    factor = brightness / 100.0
+brg_sec_times = []
+brg_bui_times = []
+brg_simd_times = []  
+brg_multi_times = []
 
-    def process_chunk(start, end):
-        pixels[start:end] = np.clip(pixels[start:end] * (1 + factor), 0, 255)
+con_sec_times = []
+con_bui_times = []
+con_simd_times = []  
+con_multi_times = []
 
-    chunk_size = len(pixels) // 4  # Négyszálas feldolgozás
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        for i in range(0, len(pixels), chunk_size):
-            executor.submit(process_chunk, i, min(i + chunk_size, len(pixels)))
+sharp_sec_times = []
+sharp_bui_times = []
+sharp_simd_times = []  
+sharp_multi_times = []
 
-    return Image.fromarray(pixels.astype(np.uint8))
+########################
+### Brightness ###
+def adjust_brightness_builtin(image, brightness):
+    # A fényerő módosítása beépített függvénnyel
+    enhancer = ImageEnhance.Brightness(image)
+    return enhancer.enhance(brightness)
 
-def calculate_contrast(img):
-    pixels = np.array(img.convert('L'))  # Convert to grayscale
-    mean_brightness = np.mean(pixels)
-    contrast = np.std(pixels)
-    return contrast
+def adjust_brightness_sec(image, brightness):
+    # A fényerő módosítása pixel szinten
+    image_array = np.array(image)
+    # A fényerő módosítása: az új pixelértékek
+    adjusted_image_array = np.clip(image_array + (brightness), 0, 255).astype(np.uint8)
+    return Image.fromarray(adjusted_image_array)
 
-def adjust_contrast_sequential(img, contrast):
-    pixels = np.array(img, dtype=np.float32)
-    mean_brightness = np.mean(pixels)
-    factor = contrast / 100.0
-    pixels = np.clip((pixels - mean_brightness) * (1 + factor) + mean_brightness, 0, 255)
-    return Image.fromarray(pixels.astype(np.uint8))
+@jit(nopython=True)  # Numba JIT alkalmazása az SIMD hatékonyság érdekében
+def adjust_brightness_simd_array(image_array, brightness):
+    # A fényerő módosítása SIMD-szerű működéssel közvetlenül a NumPy tömbön
+    return np.clip(image_array * brightness, 0, 255).astype(np.uint8)
 
-def adjust_contrast_simd(img, contrast):
-    pixels = np.array(img, dtype=np.float32)
-    mean_brightness = np.mean(pixels)
-    factor = contrast / 100.0
-    pixels = np.clip((pixels - mean_brightness) * (1 + factor) + mean_brightness, 0, 255)
-    return Image.fromarray(pixels.astype(np.uint8))
+def adjust_brightness_simd(image, brightness):
+    image_array = np.array(image)
+    adjusted_image_array = adjust_brightness_simd_array(image_array, brightness)
+    return Image.fromarray(adjusted_image_array)
 
-def adjust_contrast_multithreading(img, contrast):
-    pixels = np.array(img, dtype=np.float32)
-    mean_brightness = np.mean(pixels)
-    factor = contrast / 100.0
 
-    def process_chunk(start, end):
-        pixels[start:end] = np.clip((pixels[start:end] - mean_brightness) * (1 + factor) + mean_brightness, 0, 255)
+def adjust_brightness_multi(image, value):
+    image_array = np.array(image)
+    if image_array.ndim != 3 or image_array.shape[2] != 3:
+        raise ValueError("A bemeneti képnek RGB formátumban kell lennie.")
 
-    chunk_size = len(pixels) // 4  # Négyszálas feldolgozás
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        for i in range(0, len(pixels), chunk_size):
-            executor.submit(process_chunk, i, min(i + chunk_size, len(pixels)))
+    height, width, _ = image_array.shape
+    new_image_array = np.empty_like(image_array)
 
-    return Image.fromarray(pixels.astype(np.uint8))
-
-def adjust_vignette_sequential(img, vignette_strength):
-    width, height = img.size
-    vignette_mask = Image.new("L", (width, height), 0)
-    center_x, center_y = width // 2, height // 2
-    max_distance = np.sqrt(center_x**2 + center_y**2)
-
-    for y in range(height):
-        for x in range(width):
-            # Távolság a középponttól
-            distance = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-            # Maszk értékének számítása: középtől távolodva nő
-            vignette_value = (distance / max_distance) * 255
-            
-            # Vignette erősség alkalmazása: -100 esetén fekete, +100 esetén fehér
-            vignette_value = np.clip(vignette_value * (vignette_strength / 100), 0, 255)
-            vignette_mask.putpixel((x, y), int(vignette_value))
-
-    # Alkalmazzuk a vignette maszkot a képre
-    vignette_mask = vignette_mask.resize(img.size)
-    return Image.composite(img, Image.new("RGB", img.size, "black"), vignette_mask)
-
-def adjust_vignette_simd(img, vignette_strength):
-    width, height = img.size
-    center_x, center_y = width // 2, height // 2
-    max_distance = np.sqrt(center_x**2 + center_y**2)
-    
-    # Létrehozunk egy 2D numpy tömböt a távolságokkal
-    y, x = np.ogrid[:height, :width]
-    distances = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    
-    # Vignette maszk számítása
-    vignette_values = (distances / max_distance) * 255
-    
-    # Vignette erősség alkalmazása
-    vignette_values = np.clip(vignette_values * (vignette_strength / 100), 0, 255).astype(np.uint8)
-    
-    vignette_mask = Image.fromarray(vignette_values, mode="L")
-    return Image.composite(img, Image.new("RGB", img.size, "black"), vignette_mask)
-
-def adjust_vignette_multithreading(img, vignette_strength):
-    width, height = img.size
-    vignette_mask = Image.new("L", (width, height), 0)
-    center_x, center_y = width // 2, height // 2
-    max_distance = np.sqrt(center_x**2 + center_y**2)
-    
-    pixels = np.array(vignette_mask)
-
-    def process_chunk(start, end):
-        for y in range(start, end):
+    # Function to process a block of pixels
+    def process_block(start_row, end_row):
+        block_result = np.empty((end_row - start_row, width, 3), dtype=np.uint8)
+        for y in range(start_row, end_row):
             for x in range(width):
-                distance = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-                vignette_value = (distance / max_distance) * 255
-                
-                # Vignette erősség alkalmazása
-                vignette_value = np.clip(vignette_value * (vignette_strength / 100), 0, 255)
-                pixels[y, x] = int(vignette_value)
+                r, g, b = image_array[y, x]
+                new_r = min(int(r * value), 255)
+                new_g = min(int(g * value), 255)
+                new_b = min(int(b * value), 255)
+                block_result[y - start_row, x] = (new_r, new_g, new_b)
+        return block_result
 
-    chunk_size = height // 4  # Feldolgozás 4 szálon
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        for i in range(0, height, chunk_size):
-            executor.submit(process_chunk, i, min(i + chunk_size, height))
+    # Determine number of threads to use
+    num_threads = min(8, height)  # Limit to a reasonable number of threads
+    rows_per_thread = height // num_threads
+    blocks = [(i * rows_per_thread, (i + 1) * rows_per_thread if i < num_threads - 1 else height) for i in range(num_threads)]
 
-    vignette_mask = Image.fromarray(pixels)
-    return Image.composite(img, Image.new("RGB", img.size, "black"), vignette_mask)
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        results = list(executor.map(lambda block: process_block(*block), blocks))
 
-def adjust_sharpnes_sequential(img, intensity):
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5 + intensity / 20, -1],  # Intensity adjustment
-                       [0, -1, 0]])
-    
-    img_array = np.array(img)
-    kernel_height, kernel_width = kernel.shape
-    height, width = img_array.shape[:2]
-    new_img_array = np.zeros((height, width, 3), dtype=np.uint8)
-    pad_height = kernel_height // 2
-    pad_width = kernel_width // 2
-    padded_img = np.pad(img_array, ((pad_height, pad_height), (pad_width, pad_width), (0, 0)), mode='edge')
+    # Combine results into the final image array
+    for i, (start_row, end_row) in enumerate(blocks):
+        new_image_array[start_row:end_row] = results[i]
 
-    for y in range(height):
-        for x in range(width):
-            region = padded_img[y:y + kernel_height, x:x + kernel_width]
-            new_img_array[y, x] = np.clip(np.sum(region * kernel[:, :, np.newaxis], axis=(0, 1)), 0, 255)
+    return Image.fromarray(new_image_array)
+#######################
+### Contrast ###
+def adjust_contrast_builtin(image, contrast):
+    enhancer = ImageEnhance.Contrast(image)
+    return enhancer.enhance(contrast)
 
-    return Image.fromarray(new_img_array)
+def adjust_contrast_sec(image, contrast):
+    image_array = np.array(image).astype(np.float32)  # Típus konverzió lebegőpontos számokra
+    midpoint = 128
+    adjusted_image_array = np.clip(midpoint + contrast * (image_array - midpoint), 0, 255).astype(np.uint8)
+    return Image.fromarray(adjusted_image_array)
 
-@njit
-def adjust_sharpness_simd(img, intensity):
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5 + intensity / 20, -1],  # Intensity adjustment
-                       [0, -1, 0]])
-    img_array = img.copy()
-    kernel_height, kernel_width = kernel.shape
-    height, width = img_array.shape[:2]
-    new_img_array = np.zeros((height, width, 3), dtype=np.uint8)
-    pad_height = kernel_height // 2
-    pad_width = kernel_width // 2
-    padded_img = np.pad(img_array, ((pad_height, pad_height), (pad_width, pad_width), (0, 0)), mode='edge')
+@jit(nopython=True)  # JIT fordítás Numba-val
+def adjust_contrast_simd_array(image_array, contrast):
+    midpoint = 128
+    adjusted_image_array = np.empty_like(image_array, dtype=np.uint8)
+    for i in range(image_array.shape[0]):
+        for j in range(image_array.shape[1]):
+            adjusted_value = midpoint + contrast * (image_array[i, j] - midpoint)
+            adjusted_image_array[i, j] = np.clip(adjusted_value, 0, 255)
 
-    for y in range(height):
-        for x in range(width):
-            region = padded_img[y:y + kernel_height, x:x + kernel_width]
-            new_img_array[y, x] = np.clip(np.sum(region * kernel[:, :, np.newaxis], axis=(0, 1)), 0, 255)
+    return adjusted_image_array
 
-    return new_img_array
+def adjust_contrast_simd(image, contrast):
+    image_array = np.array(image)
+    adjusted_image_array = adjust_contrast_simd_array(image_array, contrast)
+    return Image.fromarray(adjusted_image_array)
 
-def adjust_sharpness_multithreading(img, intensity):
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5 + intensity / 20, -1],  # Intensity adjustment
-                       [0, -1, 0]])
-    img_array = np.array(img)
-    kernel_height, kernel_width = kernel.shape
-    height, width = img_array.shape[:2]
-    new_img_array = np.zeros((height, width, 3), dtype=np.uint8)
-    pad_height = kernel_height // 2
-    pad_width = kernel_width // 2
-    padded_img = np.pad(img_array, ((pad_height, pad_height), (pad_width, pad_width), (0, 0)), mode='edge')
+def adjust_contrast_segment(segment, contrast, midpoint):
+    """A kép egy részének kontrasztját módosítja."""
+    adjusted_segment = np.empty_like(segment, dtype=np.uint8)
+    for i in range(segment.shape[0]):
+        for j in range(segment.shape[1]):
+            adjusted_value = midpoint + contrast * (segment[i, j] - midpoint)
+            adjusted_segment[i, j] = np.clip(adjusted_value, 0, 255)
+    return adjusted_segment
 
-    def process_pixel(y):
-        for x in range(width):
-            region = padded_img[y:y + kernel_height, x:x + kernel_width]
-            new_img_array[y, x] = np.clip(np.sum(region * kernel[:, :, np.newaxis], axis=(0, 1)), 0, 255)
+def adjust_contrast_multi(image, contrast):
+    """A kép kontrasztját multithreading segítségével módosítja."""
+    # A kép NumPy tömbbé konvertálása
+    image_array = np.array(image).astype(np.float32)  # Típus konverzió lebegőpontos számokra
+    midpoint = 128  # Kép középértéke
+
+    # A kép felosztása sávokra
+    height, width = image_array.shape[:2]
+    num_segments = 4  # A szegmensek száma
+    segments = np.array_split(image_array, num_segments)  # Felosztás a szegmensekre
+
+    # Párhuzamos feldolgozás a ThreadPoolExecutor segítségével
+    def process_segment(segment):
+        """Feldolgozza a szegmenst a kontraszt beállításához."""
+        adjusted_segment = np.empty_like(segment, dtype=np.uint8)
+        for i in range(segment.shape[0]):
+            for j in range(segment.shape[1]):
+                adjusted_value = midpoint + contrast * (segment[i, j] - midpoint)
+                adjusted_segment[i, j] = np.clip(adjusted_value, 0, 255)
+        return adjusted_segment
 
     with ThreadPoolExecutor() as executor:
-        executor.map(process_pixel, range(height))
+        # Minden szegmenst párhuzamosan dolgozunk fel
+        futures = [executor.submit(process_segment, segment) for segment in segments]
+        adjusted_segments = [future.result() for future in futures]
 
-    return Image.fromarray(new_img_array)
+    # Az összes feldolgozott szegmenst egyesítjük
+    adjusted_image_array = np.vstack(adjusted_segments)
 
-# Histogram calculation function
-def calculate_histogram(img):
-    pixels = np.array(img)
-    if len(pixels.shape) == 3:  # RGB Image
-        histogram_r = [0] * 256
-        histogram_g = [0] * 256
-        histogram_b = [0] * 256
-        for row in pixels:
-            for pixel in row:
-                histogram_r[pixel[0]] += 1
-                histogram_g[pixel[1]] += 1
-                histogram_b[pixel[2]] += 1
-        return histogram_r, histogram_g, histogram_b
-    else:  # Grayscale image
-        histogram = [0] * 256
-        for row in pixels:
-            for pixel in row:
-                histogram[pixel] += 1
-        return histogram
-    
-# Function to draw the histogram on the canvas
-def draw_histogram(canvas, histogram_r, histogram_g, histogram_b, width=256, height=100):
-    canvas.delete("all")
-    
-    # Normalize histogram values to fit within the canvas height
-    max_value_r = max(histogram_r)
-    max_value_g = max(histogram_g)
-    max_value_b = max(histogram_b)
-    
-    for i in range(256):
-        # Normalize the heights
-        height_r = (histogram_r[i] / max_value_r) * height if max_value_r > 0 else 0
-        height_g = (histogram_g[i] / max_value_g) * height if max_value_g > 0 else 0
-        height_b = (histogram_b[i] / max_value_b) * height if max_value_b > 0 else 0
+    # A módosított NumPy tömböt visszaalakítjuk képpé
+    return Image.fromarray(adjusted_image_array)
 
-        # Draw the red channel histogram
-        canvas.create_rectangle(i, height, i + 1, height - height_r, fill="red", outline="", stipple="gray50")
+#######################
+### Vignette ###
+
+#######################
+### Sharpness ###
+def adjust_sharpness_builtin(image, sharpness):
+    # Az élesség módosítása beépített függvénnyel
+    enhancer = ImageEnhance.Sharpness(image)
+    return enhancer.enhance(sharpness)
+
+def adjust_sharpness_sec(image, sharpness_factor):
+    # Kép megnyitása és átalakítása numpy tömbbé
+    img_array = np.array(image)
+
+    # Élesség kernel definiálása
+    kernel = np.array([[0, -1, 0],
+                       [-1, 4 + sharpness_factor, -1],
+                       [0, -1, 0]])
+
+    # Kernel alkalmazása a kép minden csatornájára
+    img_sharpened = np.zeros_like(img_array)
+    for i in range(3):  # RGB csatornák
+        img_sharpened[:, :, i] = cv2.filter2D(img_array[:, :, i], -1, kernel)
+
+    # Sharpness factor skálázása a nagyobb hatás érdekében
+    if sharpness_factor < 100:
+        factor = (sharpness_factor / 100) * 1.5  # Tompítás erősebb hatással (1.5-tel skálázva)
+    else:
+        factor = ((sharpness_factor - 100) / 100) * 5000  # Élesítés erősebb hatással (5-tel skálázva)
+
+    # Keverjük az eredeti képet és az élesített képet a sharpness_factor alapján
+    output_array = cv2.addWeighted(img_array, 1 - factor, img_sharpened, factor, 0)
+
+    # Kép visszaalakítása és mentése
+    image_sharpened = Image.fromarray(np.uint8(output_array))
+    return image_sharpened
+
+
+
+
+
+
+
+@jit(nopython=True)
+def clip(value, min_value, max_value):
+    # A bemeneti értékek klippelése a megadott tartományon belül
+    clipped = np.empty_like(value)
+    for i in range(value.size):
+        if value[i] < min_value:
+            clipped[i] = min_value
+        elif value[i] > max_value:
+            clipped[i] = max_value
+        else:
+            clipped[i] = value[i]
+    return clipped
+
+@jit(nopython=True)
+def sharpen_kernel(img_array, kernel, output_array):
+    height, width, channels = img_array.shape
+    for i in range(1, height - 1):
+        for j in range(1, width - 1):
+            for c in range(channels):
+                # Kernel alkalmazása
+                pixel_value = (
+                    kernel[0, 0] * img_array[i - 1, j - 1, c] + kernel[0, 1] * img_array[i - 1, j, c] + kernel[0, 2] * img_array[i - 1, j + 1, c] +
+                    kernel[1, 0] * img_array[i, j - 1, c] + kernel[1, 1] * img_array[i, j, c] + kernel[1, 2] * img_array[i, j + 1, c] +
+                    kernel[2, 0] * img_array[i + 1, j - 1, c] + kernel[2, 1] * img_array[i + 1, j, c] + kernel[2, 2] * img_array[i + 1, j + 1, c]
+                )
+                output_array[i, j, c] = clip(np.array([pixel_value]), 0, 255)[0]
+
+def adjust_sharpness_simd(image, sharpness_factor):
+    img_array = np.array(image, dtype=np.float32)
+
+    # Élesség kernel definiálása
+    kernel = np.array([[0, -1, 0],
+                       [-1, 4 + sharpness_factor, -1],
+                       [0, -1, 0]], dtype=np.float32)
+
+    # Élesített kép inicializálása
+    img_sharpened = np.zeros_like(img_array)
+
+    # Kernel alkalmazása
+    sharpen_kernel(img_array, kernel, img_sharpened)
+
+    # Sharpness factor skálázása
+    if sharpness_factor < 100:
+        factor = (sharpness_factor / 100) * 1.5  # Tompítás erősebb hatással
+    else:
+        factor = ((sharpness_factor - 100) / 100) * 5  # Élesítés erősebb hatással
+
+    # Keverjük az eredeti képet és az élesített képet
+    output_array = np.zeros_like(img_array)
+    for c in range(img_array.shape[2]):
+        # Készítjük a kimeneti képet
+        combined = img_array[:, :, c] * (1 - factor) + img_sharpened[:, :, c] * factor
+        output_array[:, :, c] = clip(combined, 0, 255)
+
+    return Image.fromarray(output_array.astype(np.uint8))
+
+
+def adjust_sharpness_multi(image, sharpness_value):
+    import numpy as np
+
+    # Az élesség értéke alapján egy szűrőt definiálunk
+    sharpness_factor = sharpness_value / 100.0
+    kernel = np.array([[0, -1, 0],
+                       [-1, 4 + sharpness_factor, -1],
+                       [0, -1, 0]])
+
+    # Kép konvertálása numpy tömbbé
+    image_array = np.array(image)
+
+    # A képméret
+    height, width, channels = image_array.shape
+    new_image = np.zeros((height, width, channels), dtype=np.float64)  # float64 típusú tömb
+
+    # Kép élesítése
+    for i in range(1, height - 1):
+        for j in range(1, width - 1):
+            # A konvolúció kiszámítása
+            for k in range(-1, 2):
+                for l in range(-1, 2):
+                    new_image[i, j] += image_array[i + k, j + l] * kernel[k + 1, l + 1]
+                    
+            # Határértékek beállítása 0-255 között
+            new_image[i, j] = np.clip(new_image[i, j], 0, 255)
+
+    return Image.fromarray(new_image.astype('uint8'))
+
+
+
+#######################
+def update_brightness():
+    global brightness_value
+    # A fényerő beállítása a csúszka értéke alapján
+    brightness_value = brightness_slider.get() / 100.0  # Normálás 0 és 2 közötti értékre (1 = alap)
+
+    # Beépített függvény kép
+    if bui_avail > 0:
+        start_time_builtin = time.time()
+        builtin_image = adjust_brightness_builtin(original_image, brightness_value)
+        builtin_time = time.time() - start_time_builtin
+        brg_bui_times.append(builtin_time)
+        display_image(builtin_image, builtin_canvas)
+        update_histogram(builtin_image, builtin_hist_canvas)
+
+    # Szekvenciális fényerő állítás
+    if sec_avail > 0:
+        start_time_sec = time.time()
+        sequential_image = adjust_brightness_sec(original_image, brightness_value)
+        sequential_time = time.time() - start_time_sec
+        brg_sec_times.append(sequential_time)
+        display_image(sequential_image, sequential_canvas)
+        update_histogram(sequential_image, sequential_hist_canvas)
+
+    # SIMD fényerő állítás (Numba JIT segítségével)
+    if simd_avail > 0:
+        start_time_simd = time.time()
+        simd_image = adjust_brightness_simd(original_image, brightness_value)
+        simd_time = time.time() - start_time_simd
+        brg_simd_times.append(simd_time)
+        display_image(simd_image, simd_canvas)
+        update_histogram(simd_image, simd_hist_canvas)
         
-        # Draw the green channel histogram
-        canvas.create_rectangle(i, height, i + 1, height - height_g, fill="green", outline="", stipple="gray50")
-        
-        # Draw the blue channel histogram
-        canvas.create_rectangle(i, height, i + 1, height - height_b, fill="blue", outline="", stipple="gray50")
-
-    # Add grid lines for better readability
-    for j in range(0, height, 10):  # Horizontal lines every 10 pixels
-        canvas.create_line(0, height - j, width, height - j, fill="lightgray", dash=(2, 2))
+    if multi_avail > 0:
+        start_time_multi = time.time()
+        multi_image = adjust_brightness_multi(original_image, brightness_value)
+        multi_time = time.time() - start_time_multi
+        brg_multi_times.append(multi_time)
+        display_image(multi_image, multi_canvas)
+        update_histogram(multi_image, multi_hist_canvas)
     
-    # Add x-axis labels
-    for j in range(0, 256, 32):  # Label every 32 pixels
-        canvas.create_text(j, height + 10, text=str(j), fill="black")
-
-    # Add y-axis label
-    canvas.create_text(-20, height // 2, text="Frequency", fill="black", angle=90)
-
-class EditorApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Image Brightness and Contrast Adjuster")
-
-        # Load the image
-        self.original_image = Image.open("./photo.jpg")
-        self.processed_image_seq = self.original_image.copy()
-        self.processed_image_simd = self.original_image.copy()
-        self.processed_image_mt = self.original_image.copy()
-
-        # Convert images to PhotoImage
-        self.original_photo = ImageTk.PhotoImage(self.original_image)
-        self.processed_photo_seq = ImageTk.PhotoImage(self.processed_image_seq)
-        self.processed_photo_simd = ImageTk.PhotoImage(self.processed_image_simd)
-        self.processed_photo_mt = ImageTk.PhotoImage(self.processed_image_mt)
-
-        # Create labels to display images
-        self.original_label = tk.Label(root, image=self.original_photo)
-        self.original_label.grid(row=1, column=0, padx=10, pady=10)
-
-        self.processed_label_seq = tk.Label(root, image=self.processed_photo_seq)
-        self.processed_label_seq.grid(row=1, column=1, padx=10, pady=10)
-
-        self.processed_label_simd = tk.Label(root, image=self.processed_photo_simd)
-        self.processed_label_simd.grid(row=1, column=2, padx=10, pady=10)
-
-        self.processed_label_mt = tk.Label(root, image=self.processed_photo_mt)
-        self.processed_label_mt.grid(row=1, column=3, padx=10, pady=10)
-
-        # Create buttons to toggle methods
-        self.seq_button = tk.Button(root, text="Toggle Sequential", command=self.toggle_sequential)
-        self.seq_button.grid(row=2, column=1, pady=10)
-
-        self.simd_button = tk.Button(root, text="Toggle SIMD", command=self.toggle_simd)
-        self.simd_button.grid(row=2, column=2, pady=10)
-
-        self.mt_button = tk.Button(root, text="Toggle Multithreaded", command=self.toggle_multithreaded)
-        self.mt_button.grid(row=2, column=3, pady=10)
-
-        # Create sliders for brightness and contrast adjustment
-        self.brightness_slider = tk.Scale(root, from_=-100, to=100, orient=tk.HORIZONTAL, command=self.adjust_brightness, label="Brightness Intensity")
-        self.brightness_slider.grid(row=3, column=0, columnspan=3, pady=10)
-        self.brightness_slider.set(0)
-
-        self.contrast_slider = tk.Scale(root, from_=-100, to=100, orient=tk.HORIZONTAL, command=self.adjust_contrast, label="Contrast Intensity")
-        self.contrast_slider.grid(row=3, column=1, columnspan=3, pady=10)
-        self.contrast_slider.set(0)
-
-        # Create slider for vignette adjustment
-        self.vignette_slider = tk.Scale(root, from_=-100, to=100, orient=tk.HORIZONTAL, command=self.adjust_vignette, label="Vignette Intensity")
-        self.vignette_slider.grid(row=4, column=0, columnspan=3, pady=10)
-        self.vignette_slider.set(0)
-
-        # Create slider for sharpness adjustment
-        self.intensity_scale = tk.Scale(root, from_=-100, to=100, orient=tk.HORIZONTAL, command=self.adjust_sharpness, label="Sharpness Intensity")
-        self.intensity_scale.grid(row=4, column=1, columnspan=3, pady=10)
-        self.intensity_scale.set(0)  
+    display_image(original_image, original_canvas)
+    update_histogram(original_image, original_hist_canvas)
 
 
-        # Create a table to display processing time and contrast
-        self.table = ttk.Treeview(root, columns=("Operation", "Time (s)", "Avg Time (s)"), show="headings")
-        self.table.heading("Operation", text="Operation")
-        self.table.heading("Time (s)", text="Time (s)")
-        self.table.heading("Avg Time (s)", text="Avg Time (s)")
-        self.table.grid(row=5, column=0, columnspan=4, pady=10)
+    # Táblázat frissítése a feldolgozási idővel
+    update_table()
 
-        self.times_seq = []
-        self.times_simd = []
-        self.times_mt = []
+def update_contrast():
+    global contrast_value
+    # A kontraszt beállítása a csúszka értéke alapján
+    contrast_value = contrast_slider.get() / 100.0  # Normálás 0 és 2 közötti értékre (1 = alap)
 
-        self.seq_enabled = True
-        self.simd_enabled = True
-        self.mt_enabled = True
+    # Beépített függvény kép
+    if bui_avail > 0:
+        start_time_builtin = time.time()
+        builtin_image = adjust_contrast_builtin(original_image, contrast_value)
+        builtin_time = time.time() - start_time_builtin
+        con_bui_times.append(builtin_time)
+        display_image(builtin_image, builtin_canvas)
+        update_histogram(builtin_image, builtin_hist_canvas)
 
-        # Create canvas for histograms
-        self.histogram_canvas_original = tk.Canvas(root, width=256, height=100)
-        self.histogram_canvas_original.grid(row=0, column=0, padx=5, pady=5)
+    # Szekvenciális fényerő állítás
+    if sec_avail > 0:
+        start_time_sec = time.time()
+        sequential_image = adjust_contrast_sec(original_image, contrast_value)
+        sequential_time = time.time() - start_time_sec
+        con_sec_times.append(sequential_time)
+        display_image(sequential_image, sequential_canvas)
+        update_histogram(sequential_image, sequential_hist_canvas)
 
-        self.histogram_canvas_seq = tk.Canvas(root, width=256, height=100)
-        self.histogram_canvas_seq.grid(row=0, column=1, padx=5, pady=5)
+    # SIMD fényerő állítás (Numba JIT segítségével)
+    if simd_avail > 0:
+        start_time_simd = time.time()
+        simd_image = adjust_contrast_simd(original_image, contrast_value)
+        simd_time = time.time() - start_time_simd
+        con_simd_times.append(simd_time)
+        display_image(simd_image, simd_canvas)
+        update_histogram(simd_image, simd_hist_canvas)
+        
+    if multi_avail > 0:
+        start_time_multi = time.time()
+        multi_image = adjust_contrast_multi(original_image, contrast_value)
+        multi_time = time.time() - start_time_multi
+        con_multi_times.append(multi_time)
+        display_image(multi_image, multi_canvas)
+        update_histogram(multi_image, multi_hist_canvas)
+    
+    display_image(original_image, original_canvas)
+    update_histogram(original_image, original_hist_canvas)
 
-        self.histogram_canvas_simd = tk.Canvas(root, width=256, height=100)
-        self.histogram_canvas_simd.grid(row=0, column=2, padx=5, pady=5)
+    update_table()
 
-        self.histogram_canvas_mt = tk.Canvas(root, width=256, height=100)
-        self.histogram_canvas_mt.grid(row=0, column=3, padx=5, pady=5)
+def update_sharpness():
+    global sharpness_value
+    # A kontraszt beállítása a csúszka értéke alapján
+    sharpness_value = sharpness_slider.get() / 100.0  # Normálás 0 és 2 közötti értékre (1 = alap)
 
+    # Beépített függvény kép
+    if bui_avail > 0:
+        start_time_builtin = time.time()
+        builtin_image = adjust_sharpness_builtin(original_image, sharpness_value)
+        builtin_time = time.time() - start_time_builtin
+        sharp_bui_times.append(builtin_time)
+        display_image(builtin_image, builtin_canvas)
+        update_histogram(builtin_image, builtin_hist_canvas)
+    
 
-        # Initial histogram plot for the original image
-        self.update_histogram(self.original_image, self.histogram_canvas_original)
+    # Szekvenciális fényerő állítás
+    if sec_avail > 0:
+        start_time_sec = time.time()
+        sequential_image = adjust_sharpness_sec(original_image, sharpness_value)
+        sequential_time = time.time() - start_time_sec
+        sharp_sec_times.append(sequential_time)
+        display_image(sequential_image, sequential_canvas)
+        update_histogram(sequential_image, sequential_hist_canvas)
 
+    """    
 
-    def toggle_sequential(self):
-        self.seq_enabled = not self.seq_enabled
-
-    def toggle_simd(self):
-        self.simd_enabled = not self.simd_enabled
-
-    def toggle_multithreaded(self):
-        self.mt_enabled = not self.mt_enabled
-
-    def adjust_brightness(self, value):
-        value = int(value)
-        self.table.delete(*self.table.get_children())
-
-        if self.seq_enabled:
-            # Sequential brightness adjustment
-            start_time_seq = time.perf_counter()
-            self.processed_image_seq = adjust_brightness_sequential(self.original_image, value)
-            end_time_seq = time.perf_counter()
-            elapsed_time_seq = end_time_seq - start_time_seq
-            self.times_seq.append(elapsed_time_seq)
-            avg_time_seq = sum(self.times_seq) / len(self.times_seq)
-            contrast_seq = calculate_contrast(self.processed_image_seq)
-            self.processed_photo_seq = ImageTk.PhotoImage(self.processed_image_seq)
-            self.processed_label_seq.config(image=self.processed_photo_seq)
-            self.processed_label_seq.image = self.processed_photo_seq
-            self.table.insert("", "end", values=("Sequential Brightness", f"{elapsed_time_seq:.5f}", f"{avg_time_seq:.5f}", f"{contrast_seq:.5f}"))
-            self.update_histogram(self.processed_image_seq, self.histogram_canvas_seq)
-
-        if self.simd_enabled:
-            # SIMD brightness adjustment
-            start_time_simd = time.perf_counter()
-            self.processed_image_simd = adjust_brightness_simd(self.original_image, value)
-            end_time_simd = time.perf_counter()
-            elapsed_time_simd = end_time_simd - start_time_simd
-            self.times_simd.append(elapsed_time_simd)
-            avg_time_simd = sum(self.times_simd) / len(self.times_simd)
-            contrast_simd = calculate_contrast(self.processed_image_simd)
-            self.processed_photo_simd = ImageTk.PhotoImage(self.processed_image_simd)
-            self.processed_label_simd.config(image=self.processed_photo_simd)
-            self.processed_label_simd.image = self.processed_photo_simd
-            self.table.insert("", "end", values=("SIMD Brightness", f"{elapsed_time_simd:.5f}", f"{avg_time_simd:.5f}", f"{contrast_simd:.5f}"))
-            self.update_histogram(self.processed_image_simd, self.histogram_canvas_simd)
-
-        if self.mt_enabled:
-            # Multithreaded brightness adjustment
-            start_time_mt = time.perf_counter()
-            self.processed_image_mt = adjust_brightness_multithreading(self.original_image, value)
-            end_time_mt = time.perf_counter()
-            elapsed_time_mt = end_time_mt - start_time_mt
-            self.times_mt.append(elapsed_time_mt)
-            avg_time_mt = sum(self.times_mt) / len(self.times_mt)
-            contrast_mt = calculate_contrast(self.processed_image_mt)
-            self.processed_photo_mt = ImageTk.PhotoImage(self.processed_image_mt)
-            self.processed_label_mt.config(image=self.processed_photo_mt)
-            self.processed_label_mt.image = self.processed_photo_mt
-            self.table.insert("", "end", values=("Multithreaded Brightness", f"{elapsed_time_mt:.5f}", f"{avg_time_mt:.5f}", f"{contrast_mt:.5f}"))
-            self.update_histogram(self.processed_image_mt, self.histogram_canvas_mt)
-
-        # Update histogram
-        self.update_histogram()
-
-    def adjust_contrast(self, value):
-        value = int(value)
-        self.table.delete(*self.table.get_children())
-
-        if self.seq_enabled:
-            # Sequential contrast adjustment
-            start_time_seq = time.perf_counter()
-            self.processed_image_seq = adjust_contrast_sequential(self.original_image, value)
-            end_time_seq = time.perf_counter()
-            elapsed_time_seq = end_time_seq - start_time_seq
-            self.times_seq.append(elapsed_time_seq)
-            avg_time_seq = sum(self.times_seq) / len(self.times_seq)
-            contrast_seq = calculate_contrast(self.processed_image_seq)
-            self.processed_photo_seq = ImageTk.PhotoImage(self.processed_image_seq)
-            self.processed_label_seq.config(image=self.processed_photo_seq)
-            self.processed_label_seq.image = self.processed_photo_seq
-            self.table.insert("", "end", values=("Sequential Contrast", f"{elapsed_time_seq:.5f}", f"{avg_time_seq:.5f}", f"{contrast_seq:.5f}"))
-            self.update_histogram(self.processed_image_seq, self.histogram_canvas_seq)
-
-        if self.simd_enabled:
-            # SIMD contrast adjustment
-            start_time_simd = time.perf_counter()
-            self.processed_image_simd = adjust_contrast_simd(self.original_image, value)
-            end_time_simd = time.perf_counter()
-            elapsed_time_simd = end_time_simd - start_time_simd
-            self.times_simd.append(elapsed_time_simd)
-            avg_time_simd = sum(self.times_simd) / len(self.times_simd)
-            contrast_simd = calculate_contrast(self.processed_image_simd)
-            self.processed_photo_simd = ImageTk.PhotoImage(self.processed_image_simd)
-            self.processed_label_simd.config(image=self.processed_photo_simd)
-            self.processed_label_simd.image = self.processed_photo_simd
-            self.table.insert("", "end", values=("SIMD Contrast", f"{elapsed_time_simd:.5f}", f"{avg_time_simd:.5f}", f"{contrast_simd:.5f}"))
-            self.update_histogram(self.processed_image_simd, self.histogram_canvas_simd)
-
-        if self.mt_enabled:
-            # Multithreaded contrast adjustment
-            start_time_mt = time.perf_counter()
-            self.processed_image_mt = adjust_contrast_multithreading(self.original_image, value)
-            end_time_mt = time.perf_counter()
-            elapsed_time_mt = end_time_mt - start_time_mt
-            self.times_mt.append(elapsed_time_mt)
-            avg_time_mt = sum(self.times_mt) / len(self.times_mt)
-            contrast_mt = calculate_contrast(self.processed_image_mt)
-            self.processed_photo_mt = ImageTk.PhotoImage(self.processed_image_mt)
-            self.processed_label_mt.config(image=self.processed_photo_mt)
-            self.processed_label_mt.image = self.processed_photo_mt
-            self.table.insert("", "end", values=("Multithreaded Contrast", f"{elapsed_time_mt:.5f}", f"{avg_time_mt:.5f}", f"{contrast_mt:.5f}"))
-            self.update_histogram(self.processed_image_mt, self.histogram_canvas_mt)
-
-    def adjust_vignette(self, value):
-        value = int(value)
-        self.table.delete(*self.table.get_children())
-
-        if self.seq_enabled:
-            # Sequential vignette adjustment
-            start_time_seq = time.perf_counter()
-            self.processed_image_seq = adjust_vignette_sequential(self.original_image, value)
-            end_time_seq = time.perf_counter()
-            elapsed_time_seq = end_time_seq - start_time_seq
-            self.times_seq.append(elapsed_time_seq)
-            avg_time_seq = sum(self.times_seq) / len(self.times_seq)
-            contrast_seq = calculate_contrast(self.processed_image_seq)
-            self.processed_photo_seq = ImageTk.PhotoImage(self.processed_image_seq)
-            self.processed_label_seq.config(image=self.processed_photo_seq)
-            self.processed_label_seq.image = self.processed_photo_seq
-            self.table.insert("", "end", values=("Sequential Vignette", f"{elapsed_time_seq:.5f}", f"{avg_time_seq:.5f}", f"{contrast_seq:.5f}"))
-            self.update_histogram(self.processed_image_seq, self.histogram_canvas_seq)
-
-        if self.simd_enabled:
-            # SIMD vignette adjustment
-            start_time_simd = time.perf_counter()
-            self.processed_image_simd = adjust_vignette_simd(self.original_image, value)
-            end_time_simd = time.perf_counter()
-            elapsed_time_simd = end_time_simd - start_time_simd
-            self.times_simd.append(elapsed_time_simd)
-            avg_time_simd = sum(self.times_simd) / len(self.times_simd)
-            contrast_simd = calculate_contrast(self.processed_image_simd)
-            self.processed_photo_simd = ImageTk.PhotoImage(self.processed_image_simd)
-            self.processed_label_simd.config(image=self.processed_photo_simd)
-            self.processed_label_simd.image = self.processed_photo_simd
-            self.table.insert("", "end", values=("SIMD Vignette", f"{elapsed_time_simd:.5f}", f"{avg_time_simd:.5f}", f"{contrast_simd:.5f}"))
-            self.update_histogram(self.processed_image_simd, self.histogram_canvas_simd)
-
-        if self.mt_enabled:
-            # Multithreaded vignette adjustment
-            start_time_mt = time.perf_counter()
-            self.processed_image_mt = adjust_vignette_multithreading(self.original_image, value)
-            end_time_mt = time.perf_counter()
-            elapsed_time_mt = end_time_mt - start_time_mt
-            self.times_mt.append(elapsed_time_mt)
-            avg_time_mt = sum(self.times_mt) / len(self.times_mt)
-            contrast_mt = calculate_contrast(self.processed_image_mt)
-            self.processed_photo_mt = ImageTk.PhotoImage(self.processed_image_mt)
-            self.processed_label_mt.config(image=self.processed_photo_mt)
-            self.processed_label_mt.image = self.processed_photo_mt
-            self.table.insert("", "end", values=("Multithreaded Vignette", f"{elapsed_time_mt:.5f}", f"{avg_time_mt:.5f}", f"{contrast_mt:.5f}"))
-            self.update_histogram(self.processed_image_mt, self.histogram_canvas_mt)
-
-    def adjust_sharpness(self, value):
-        value = int(value)
-        self.table.delete(*self.table.get_children())
-
-        if self.seq_enabled:
-            # Sequential sharpness adjustment
-            start_time_seq = time.perf_counter()
-            self.processed_image_seq = adjust_sharpnes_sequential(self.original_image, value)
-            end_time_seq = time.perf_counter()
-            elapsed_time_seq = end_time_seq - start_time_seq
-            self.times_seq.append(elapsed_time_seq)
-            avg_time_seq = sum(self.times_seq) / len(self.times_seq)
-            contrast_seq = calculate_contrast(self.processed_image_seq)
-            self.processed_photo_seq = ImageTk.PhotoImage(self.processed_image_seq)
-            self.processed_label_seq.config(image=self.processed_photo_seq)
-            self.processed_label_seq.image = self.processed_photo_seq
-            self.table.insert("", "end", values=("Sequential Sharpness", f"{elapsed_time_seq:.5f}", f"{avg_time_seq:.5f}", f"{contrast_seq:.5f}"))
-            self.update_histogram(self.processed_image_seq, self.histogram_canvas_seq)
-
-        if self.simd_enabled:
-            # SIMD sharpness adjustment
-            start_time_simd = time.perf_counter()
-            self.processed_image_simd = adjust_sharpness_simd(self.original_image, value)
-            end_time_simd = time.perf_counter()
-            elapsed_time_simd = end_time_simd - start_time_simd
-            self.times_simd.append(elapsed_time_simd)
-            avg_time_simd = sum(self.times_simd) / len(self.times_simd)
-            contrast_simd = calculate_contrast(self.processed_image_simd)
-            self.processed_photo_simd = ImageTk.PhotoImage(self.processed_image_simd)
-            self.processed_label_simd.config(image=self.processed_photo_simd)
-            self.processed_label_simd.image = self.processed_photo_simd
-            self.table.insert("", "end", values=("SIMD sharpness", f"{elapsed_time_simd:.5f}", f"{avg_time_simd:.5f}", f"{contrast_simd:.5f}"))
-            self.update_histogram(self.processed_image_simd, self.histogram_canvas_simd)
-
-        if self.mt_enabled:
-            # Multithreaded sharpness adjustment
-            start_time_mt = time.perf_counter()
-            self.processed_image_mt = adjust_sharpness_multithreading(self.original_image, value)
-            end_time_mt = time.perf_counter()
-            elapsed_time_mt = end_time_mt - start_time_mt
-            self.times_mt.append(elapsed_time_mt)
-            avg_time_mt = sum(self.times_mt) / len(self.times_mt)
-            contrast_mt = calculate_contrast(self.processed_image_mt)
-            self.processed_photo_mt = ImageTk.PhotoImage(self.processed_image_mt)
-            self.processed_label_mt.config(image=self.processed_photo_mt)
-            self.processed_label_mt.image = self.processed_photo_mt
-            self.table.insert("", "end", values=("Multithreaded sharpness", f"{elapsed_time_mt:.5f}", f"{avg_time_mt:.5f}", f"{contrast_mt:.5f}"))
-            self.update_histogram(self.processed_image_mt, self.histogram_canvas_mt)
+    # SIMD fényerő állítás (Numba JIT segítségével)
+    if simd_avail > 0:
+        start_time_simd = time.time()
+        simd_image = adjust_sharpness_simd(original_image, sharpness_value)
+        simd_time = time.time() - start_time_simd
+        sharp_simd_times.append(simd_time)
+        display_image(simd_image, simd_canvas)
+        update_histogram(simd_image, simd_hist_canvas)
+    """
+        
+    if multi_avail > 0:
+        start_time_multi = time.time()
+        multi_image = adjust_sharpness_multi(original_image, sharpness_value)
+        multi_time = time.time() - start_time_multi
+        sharp_multi_times.append(multi_time)
+        display_image(multi_image, multi_canvas)
+        update_histogram(multi_image, multi_hist_canvas)
 
 
-    def update_histogram(self, image, canvas):
-        histogram = image.histogram()
-        canvas.delete("all")  # Clear previous histogram
-        for i in range(256):
-            canvas.create_line(i, 100, i, 100 - histogram[i] / 100, fill="black")
+    display_image(original_image, original_canvas)
+    update_histogram(original_image, original_hist_canvas)
 
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = EditorApp(root)
-    root.mainloop()
+    update_table()
+
+def display_image(image, canvas):
+    image_tk = ImageTk.PhotoImage(image.resize((240, 240)))  # Kisebb méret (240x240)
+    canvas.create_image(0, 0, anchor=NW, image=image_tk)
+    canvas.image = image_tk
+
+def update_histogram(image, canvas):
+    # Hisztogram generálása
+    canvas.delete("all")  # Törli a korábbi hisztogramot
+    histogram = image.histogram()
+    colors = ('red', 'green', 'blue')
+    
+    # Hisztogram háttér színének beállítása
+    canvas.configure(bg='lightgrey')  # Világosszürke háttér
+
+    for i, color in enumerate(colors):
+        hist_data = histogram[i * 256:(i + 1) * 256]
+        
+        if not hist_data:  # If hist_data is empty, skip to avoid errors
+            continue
+
+        max_value = max(hist_data)
+        if max_value == 0:  # Avoid division by zero
+            max_value = 1
+        
+        # Hisztogram vonalak rajzolása
+        canvas.create_line([(x, 100 - y / max_value * 100) for x, y in enumerate(hist_data)], fill=color)
+
+def update_table():
+    for row in table.get_children():
+        table.delete(row)
+
+    # Fényerő    
+    # Átlagos idő kiszámítása
+    avg_time_brg_bui = sum(brg_bui_times[2:]) / len(brg_bui_times[2:]) if len(brg_bui_times) > 2 else 0
+    avg_time_brg_sec = sum(brg_sec_times[2:]) / len(brg_sec_times[2:]) if len(brg_sec_times) > 2 else 0
+    avg_time_brg_simd = sum(brg_simd_times[2:]) / len(brg_simd_times[2:]) if len(brg_simd_times) > 2 else 0
+    avg_time_brg_multi = sum(brg_multi_times[2:]) / len(brg_multi_times[2:]) if len(brg_multi_times) > 2 else 0
+
+    if len(brg_bui_times) > 2:
+        table.insert('', 'end', values=("Fényerő beépített", f"{brg_bui_times[-1]:.6f} mp", f"{avg_time_brg_bui:.6f} mp"))
+    if len(brg_sec_times) > 2:
+        table.insert('', 'end', values=("Fényerő szekvenciális", f"{brg_sec_times[-1]:.6f} mp", f"{avg_time_brg_sec:.6f} mp"))
+    if len(brg_simd_times) > 2:
+        table.insert('', 'end', values=("Fényerő SIMD", f"{brg_simd_times[-1]:.6f} mp", f"{avg_time_brg_simd:.6f} mp"))
+    if len(brg_multi_times) > 2:
+        table.insert('', 'end', values=("Fényerő multi", f"{brg_multi_times[-1]:.6f} mp", f"{avg_time_brg_multi:.6f} mp"))
+
+
+    # Kontraszt
+    # Átlagos idő kiszámítása
+    avg_time_con_bui = sum(con_bui_times[2:]) / len(con_bui_times[2:]) if len(con_bui_times) > 2 else 0
+    avg_time_con_sec = sum(con_sec_times[2:]) / len(con_sec_times[2:]) if len(con_sec_times) > 2 else 0
+    avg_time_con_simd = sum(con_simd_times[2:]) / len(con_simd_times[2:]) if len(con_simd_times) > 2 else 0
+    avg_time_con_multi = sum(con_multi_times[2:]) / len(con_multi_times[2:]) if len(con_multi_times) > 2 else 0
+
+    if len(con_bui_times) > 2:
+        table.insert('', 'end', values=("Kontraszt beépített", f"{con_bui_times[-1]:.6f} mp", f"{avg_time_con_bui:.6f} mp"))
+    if len(con_sec_times) > 2:
+        table.insert('', 'end', values=("Kontraszt szekvenciális", f"{con_sec_times[-1]:.6f} mp", f"{avg_time_con_sec:.6f} mp"))
+    if len(con_simd_times) > 2:
+        table.insert('', 'end', values=("Kontraszt SIMD", f"{con_simd_times[-1]:.6f} mp", f"{avg_time_con_simd:.6f} mp"))
+    if len(con_multi_times) > 2:
+        table.insert('', 'end', values=("Kontraszt multi", f"{con_multi_times[-1]:.6f} mp", f"{avg_time_con_multi:.6f} mp"))
+   
+    # Sharpness
+    # Átlagos idő kiszámítása
+    avg_time_sharp_bui = sum(sharp_bui_times[2:]) / len(sharp_bui_times[2:]) if len(sharp_bui_times) > 2 else 0
+    avg_time_sharp_sec = sum(sharp_sec_times[2:]) / len(sharp_sec_times[2:]) if len(sharp_sec_times) > 2 else 0
+    avg_time_sharp_simd = sum(sharp_simd_times[2:]) / len(sharp_simd_times[2:]) if len(sharp_simd_times) > 2 else 0
+    avg_time_sharp_multi = sum(sharp_multi_times[2:]) / len(sharp_multi_times[2:]) if len(sharp_multi_times) > 2 else 0
+
+    if len(sharp_bui_times) > 2:
+        table.insert('', 'end', values=("Élesség beépített", f"{sharp_bui_times[-1]:.6f} mp", f"{avg_time_sharp_bui:.6f} mp"))
+    if len(sharp_sec_times) > 2:
+        table.insert('', 'end', values=("Élesség szekvenciális", f"{sharp_sec_times[-1]:.6f} mp", f"{avg_time_sharp_sec:.6f} mp"))
+    if len(sharp_simd_times) > 2:
+        table.insert('', 'end', values=("Élesség SIMD", f"{sharp_simd_times[-1]:.6f} mp", f"{avg_time_sharp_simd:.6f} mp"))
+    if len(sharp_multi_times) > 2:
+        table.insert('', 'end', values=("Élesség multi", f"{sharp_multi_times[-1]:.6f} mp", f"{avg_time_sharp_multi:.6f} mp"))
+ 
+
+
+# Főablak létrehozása
+root = Tk()
+root.title("Kép szerkesztés")
+
+# Teljes képernyős mód bekapcsolása
+root.attributes('-fullscreen', True)
+
+# Bezárás ESC gomb vagy Ctrl+C megnyomásával
+root.bind("<Escape>", lambda e: root.destroy())
+root.bind("<Control-c>", lambda e: root.destroy())
+
+# Háttérszín beállítása sötétszürkére
+root.configure(bg='#2e2e2e')
+
+# Eredeti kép megjelenítése
+original_canvas = Canvas(root, width=240, height=240, bg='#2e2e2e', highlightthickness=0)
+original_canvas.grid(row=0, column=0, padx=20, pady=20)
+original_hist_canvas = Canvas(root, width=240, height=100, bg='lightgrey', highlightthickness=0)
+original_hist_canvas.grid(row=1, column=0, padx=20, pady=20)
+
+# Beépített függvény kép megjelenítése
+builtin_canvas = Canvas(root, width=240, height=240, bg='#2e2e2e', highlightthickness=0)
+builtin_canvas.grid(row=0, column=1, padx=20, pady=20)
+builtin_hist_canvas = Canvas(root, width=240, height=100, bg='lightgrey', highlightthickness=0)
+builtin_hist_canvas.grid(row=1, column=1, padx=20, pady=20)
+
+# Szekvenciális kép megjelenítése
+sequential_canvas = Canvas(root, width=240, height=240, bg='#2e2e2e', highlightthickness=0)
+sequential_canvas.grid(row=0, column=2, padx=20, pady=20)
+sequential_hist_canvas = Canvas(root, width=240, height=100, bg='lightgrey', highlightthickness=0)
+sequential_hist_canvas.grid(row=1, column=2, padx=20, pady=20)
+
+# SIMD kép megjelenítése
+simd_canvas = Canvas(root, width=240, height=240, bg='#2e2e2e', highlightthickness=0)
+simd_canvas.grid(row=0, column=3, padx=20, pady=20)
+simd_hist_canvas = Canvas(root, width=240, height=100, bg='lightgrey', highlightthickness=0)
+simd_hist_canvas.grid(row=1, column=3, padx=20, pady=20)
+
+# Multithreading kép megjelenítése
+multi_canvas = Canvas(root, width=240, height=240, bg='#2e2e2e', highlightthickness=0)
+multi_canvas.grid(row=0, column=4, padx=20, pady=20)
+multi_hist_canvas = Canvas(root, width=240, height=100, bg='lightgrey', highlightthickness=0)
+multi_hist_canvas.grid(row=1, column=4, padx=20, pady=20)
+
+# Csúszka a fényerő állításához
+brightness_slider = Scale(root, from_=0, to=200, orient=HORIZONTAL, command=lambda _: update_brightness(), label="Fényerő")
+brightness_slider.set(100)
+brightness_slider.grid(row=4, column=1, columnspan=5, pady=20, padx=80, sticky=W)
+
+# Kontraszt csúszka hozzáadása
+contrast_slider = Scale(root, from_=0, to=200, orient=HORIZONTAL, command=lambda _: update_contrast(), label="Kontraszt")
+contrast_slider.set(100)
+contrast_slider.grid(row=4, column=2, columnspan=5, pady=20, padx=80, sticky=W)
+
+# Élesség csúszka hozzáadása
+sharpness_slider = Scale(root, from_=0, to=200, orient=HORIZONTAL, command=lambda _: update_sharpness(), label="Élesség")
+sharpness_slider.set(100)
+sharpness_slider.grid(row=4, column=3, columnspan=5, pady=20, padx=80, sticky=W)
+
+
+# Táblázat a feldolgozási idők megjelenítéséhez
+table_frame = Frame(root, bg='#2e2e2e')
+table_frame.grid(row=6, column=0, columnspan=6, pady=20)
+table = ttk.Treeview(table_frame, columns=("Algoritmus", "Idő", "Átlagos idő"), show="headings", height=10)
+table.heading("Algoritmus", text="Algoritmus")
+table.heading("Idő", text="Idő (mp)")
+table.heading("Átlagos idő", text="Átlagos idő (mp)")
+table.pack()
+
+Label(root, text="Eredeti", bg='#2e2e2e', fg='white').grid(row=2, column=0)
+Label(root, text="Beépített", bg='#2e2e2e', fg='white').grid(row=2, column=1)
+Label(root, text="Szekvenciális", bg='#2e2e2e', fg='white').grid(row=2, column=2)
+Label(root, text="SIMD", bg='#2e2e2e', fg='white').grid(row=2, column=3)
+Label(root, text="Multi", bg='#2e2e2e', fg='white').grid(row=2, column=4)
+
+
+def update_button_texts():
+    builtin_text = f"Beépített {'kikapcsolva' if bui_avail < 0 else 'bekapcsolva'}"
+    sequential_text = f"Szekvenciális {'kikapcsolva' if sec_avail < 0 else 'bekapcsolva'}"
+    multi_text = f"Multi {'kikapcsolva' if multi_avail < 0 else 'bekapcsolva'}"
+    simd_text = f"SIMD {'kikapcsolva' if simd_avail < 0 else 'bekapcsolva'}"
+
+    # Gombok szövegének frissítése
+    builtin_button.config(text=builtin_text)
+    sequential_button.config(text=sequential_text)
+    simd_button.config(text=simd_text)
+    multi_button.config(text=multi_text)
+
+def toggle_builtin():
+    global bui_avail
+    bui_avail *= -1  # Ki-/bekapcsolás
+    update_button_texts()
+    update_brightness()  # Frissítés szükséges a kapcsolt állapot alapján
+
+def toggle_sequential():
+    global sec_avail
+    sec_avail *= -1  # Ki-/bekapcsolás
+    update_button_texts()
+    update_brightness()  # Frissítés szükséges a kapcsolt állapot alapján
+
+def toggle_simd():
+    global simd_avail
+    simd_avail *= -1  # Ki-/bekapcsolás
+    update_button_texts()
+    update_brightness()  # Frissítés szükséges a kapcsolt állapot alapján
+
+def toggle_multi():
+    global multi_avail
+    multi_avail *= -1  # Ki-/bekapcsolás
+    update_button_texts()
+    update_brightness()  # Frissítés szükséges a kapcsolt állapot alapján
+
+button_frame = Frame(root, bg='#2e2e2e')
+button_frame.grid(row=3, column=1, columnspan=5, pady=20)
+
+builtin_button = Button(button_frame, text="Beépített bekapcsolva", command=toggle_builtin)
+builtin_button.pack(side=LEFT, padx=80)
+
+sequential_button = Button(button_frame, text="Szekvenciális bekapcsolva", command=toggle_sequential)
+sequential_button.pack(side=LEFT, padx=80)
+
+simd_button = Button(button_frame, text="SIMD bekapcsolva", command=toggle_simd)
+simd_button.pack(side=LEFT, padx=80)
+
+multi_button = Button(button_frame, text="Multi bekapcsolva", command=toggle_multi)
+multi_button.pack(side=LEFT, padx=80)
+
+# Első frissítés
+update_brightness()
+update_contrast()
+update_sharpness()
+
+# Fő program futtatása
+root.mainloop()
